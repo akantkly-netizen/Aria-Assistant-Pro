@@ -10,7 +10,7 @@ import shutil
 import subprocess
 from datetime import datetime
 from pyrogram import Client, filters, idle
-from pyrogram.enums import ChatAction
+from pyrogram.enums import ChatAction, ParseMode
 from pyrogram.raw import functions
 from pyrogram.handlers import InlineQueryHandler, CallbackQueryHandler
 from pyrogram.types import (
@@ -410,12 +410,26 @@ def panel_text():
         "با دکمه‌های زیر عوضشون کن 👇"
     )
 
-def panel_markup():
+def panel_markup(fid=0):
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton(f"👻 گوست مود: {on_off(settings['ghost'])}", callback_data="p_ghost")],
-        [InlineKeyboardButton(f"⌨️ افکت تایپ: {on_off(settings['typing_fx'])}", callback_data="p_typing")],
-        [InlineKeyboardButton("✖️ بستن پنل", callback_data="p_close")],
+        [InlineKeyboardButton(f"👻 گوست مود: {on_off(settings['ghost'])}", callback_data=f"p_ghost:{fid}")],
+        [InlineKeyboardButton(f"⌨️ افکت تایپ: {on_off(settings['typing_fx'])}", callback_data=f"p_typing:{fid}")],
+        [InlineKeyboardButton("🎮 بازی‌ها", callback_data=f"p_games:{fid}")],
+        [InlineKeyboardButton("✖️ بستن پنل", callback_data=f"p_close:{fid}")],
     ])
+
+def games_text():
+    return "🎮 **بخش بازی‌ها**\n\n🎲 منچ دو نفره — باید پنل رو توی پیوی دوستت باز کرده باشی 👇"
+
+def games_markup(fid=0):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🎲 منچ (دو نفره)", callback_data=f"p_ludo:{fid}")],
+        [InlineKeyboardButton("⬅️ برگشت", callback_data=f"p_back:{fid}")],
+    ])
+
+def parse_fid(value):
+    value = (value or "").strip()
+    return int(value) if value.lstrip("-").isdigit() else 0
 
 async def panel_inline_query(client, query):
     print(f"📩 inline query از {query.from_user.id}")
@@ -423,36 +437,297 @@ async def panel_inline_query(client, query):
     if OWNER_ID is None or query.from_user.id != OWNER_ID:
         await query.answer([], cache_time=1, is_personal=True)
         return
+    parts = (query.query or "").split()
+    fid = parse_fid(parts[1]) if len(parts) > 1 else 0
     await query.answer(
         [InlineQueryResultArticle(
             id="panel",
             title="🎛 پنل کنترل آریا",
             input_message_content=InputTextMessageContent(panel_text()),
-            reply_markup=panel_markup()
+            reply_markup=panel_markup(fid)
         )],
         cache_time=0, is_personal=True
     )
 
 async def panel_callback(client, cq):
+    data = cq.data or ""
+
+    # 🎲 دکمه‌های بازی منچ: هر دو بازیکن می‌تونن بزنن
+    if data.startswith("lg:"):
+        await ludo_callback(client, cq)
+        return
+
+    # بقیه دکمه‌ها فقط برای خودت
     if OWNER_ID is None or cq.from_user.id != OWNER_ID:
         await cq.answer("این پنل مال تو نیست 😎", show_alert=True)
         return
-    if cq.data == "p_ghost":
-        set_ghost(not settings["ghost"])
-    elif cq.data == "p_typing":
-        set_typing_fx(not settings["typing_fx"])
-    elif cq.data == "p_close":
-        try:
-            await cq.edit_message_text("🎛 پنل بسته شد.")
-        except Exception:
-            pass
-        await cq.answer()
-        return
+
+    action, _, fid_s = data.partition(":")
+    fid = parse_fid(fid_s)
+
     try:
-        await cq.edit_message_text(panel_text(), reply_markup=panel_markup())
+        if action == "p_ghost":
+            set_ghost(not settings["ghost"])
+            await cq.edit_message_text(panel_text(), reply_markup=panel_markup(fid))
+        elif action == "p_typing":
+            set_typing_fx(not settings["typing_fx"])
+            await cq.edit_message_text(panel_text(), reply_markup=panel_markup(fid))
+        elif action == "p_games":
+            await cq.edit_message_text(games_text(), reply_markup=games_markup(fid))
+        elif action == "p_back":
+            await cq.edit_message_text(panel_text(), reply_markup=panel_markup(fid))
+        elif action == "p_close":
+            await cq.edit_message_text("🎛 پنل بسته شد.")
+        elif action == "p_ludo":
+            if fid <= 0 or fid == OWNER_ID:
+                await cq.answer("منچ دو نفرست؛ پنل رو توی پیوی دوستت باز کن 🎲", show_alert=True)
+                return
+            friend_name = "دوست"
+            try:
+                friend = await app.get_users(fid)
+                friend_name = friend.first_name or "دوست"
+            except Exception:
+                pass
+            g = ludo_new([OWNER_ID, fid], [cq.from_user.first_name or "آریا", friend_name])
+            LUDO_GAMES[cq.inline_message_id] = g
+            await cq.edit_message_text(ludo_text(g), parse_mode=ParseMode.DISABLED, reply_markup=ludo_markup(g))
+            await cq.answer("بازی شروع شد 🎲")
+            return
     except Exception as e:
         print(f"panel edit error: {e}")
     await cq.answer("انجام شد ✅")
+
+# ==================== 🎲 منچ دو نفره ====================
+# مسیر ۵۲ خونه‌ای روی صفحه ۱۵×۱۵ (ردیف، ستون)
+LUDO_PATH = [
+    (6,1),(6,2),(6,3),(6,4),(6,5),
+    (5,6),(4,6),(3,6),(2,6),(1,6),(0,6),
+    (0,7),(0,8),
+    (1,8),(2,8),(3,8),(4,8),(5,8),
+    (6,9),(6,10),(6,11),(6,12),(6,13),(6,14),
+    (7,14),(8,14),
+    (8,13),(8,12),(8,11),(8,10),(8,9),
+    (9,8),(10,8),(11,8),(12,8),(13,8),(14,8),
+    (14,7),(14,6),
+    (13,6),(12,6),(11,6),(10,6),(9,6),
+    (8,5),(8,4),(8,3),(8,2),(8,1),(8,0),
+    (7,0),(6,0),
+]
+LUDO_HOME = [[(7,1),(7,2),(7,3),(7,4),(7,5)], [(7,13),(7,12),(7,11),(7,10),(7,9)]]
+LUDO_YARD = [[(2,2),(2,3),(3,2),(3,3)], [(11,11),(11,12),(12,11),(12,12)]]
+LUDO_START = [0, 26]
+LUDO_SAFE = {0, 8, 13, 21, 26, 34, 39, 47}
+LUDO_PAWNS = [["🔴","🟠","🟡","🟤"], ["🔵","🟣","🟢","⚫"]]
+LUDO_GAMES = {}   # inline_message_id -> وضعیت بازی
+
+def _ludo_base():
+    g = [["⬛"] * 15 for _ in range(15)]
+    for (r, c) in LUDO_PATH:
+        g[r][c] = "⬜"
+    for idx in LUDO_SAFE:
+        r, c = LUDO_PATH[idx]
+        g[r][c] = "⭐"
+    r, c = LUDO_PATH[0];  g[r][c] = "🟥"
+    r, c = LUDO_PATH[26]; g[r][c] = "🟦"
+    for k, sq in ((0, "🟥"), (1, "🟦")):
+        for (r, c) in LUDO_HOME[k]:
+            g[r][c] = sq
+    for r in range(1, 5):
+        for c in range(1, 5):
+            g[r][c] = "⬜"
+    for r in range(10, 14):
+        for c in range(10, 14):
+            g[r][c] = "⬜"
+    g[7][7] = "🏁"
+    return g
+
+LUDO_BASE = _ludo_base()
+
+def ludo_new(ids, names):
+    return {
+        "ids": ids, "names": names,
+        "pos": [[0, 0, 0, 0], [0, 0, 0, 0]],   # 0=حیاط، 1..51=مسیر، 52..56=راه خونه، 57=رسیده
+        "turn": 0, "dice": None, "legal": [], "sixes": 0, "winner": None,
+        "log": "🎲 بازی شروع شد! نفر اول تاس بندازه.",
+    }
+
+def ludo_cell(k, i, s):
+    if s == 0:
+        return LUDO_YARD[k][i]
+    if s <= 51:
+        return LUDO_PATH[(LUDO_START[k] + s - 1) % 52]
+    if s <= 56:
+        return LUDO_HOME[k][s - 52]
+    return None
+
+def ludo_render(g):
+    grid = [row[:] for row in LUDO_BASE]
+    for k in (0, 1):
+        for i, s in enumerate(g["pos"][k]):
+            cell = ludo_cell(k, i, s)
+            if cell:
+                grid[cell[0]][cell[1]] = LUDO_PAWNS[k][i]
+    return "\n".join("".join(row) for row in grid)
+
+def ludo_legal(g, k, d):
+    res = []
+    for i, s in enumerate(g["pos"][k]):
+        if s == 0:
+            if d == 6:
+                res.append(i)
+        elif s < 57 and s + d <= 57:
+            res.append(i)
+    return res
+
+def ludo_move(g, k, i, d):
+    pos = g["pos"]
+    s = pos[k][i]
+    new = 1 if s == 0 else s + d
+    pos[k][i] = new
+    name = g["names"][k]
+    pawn = LUDO_PAWNS[k][i]
+    extra = (d == 6)
+    text = f"{name} مهره {pawn} رو " + ("از حیاط آورد بیرون" if s == 0 else f"{d} خونه برد")
+    if 1 <= new <= 51:
+        a = (LUDO_START[k] + new - 1) % 52
+        if a not in LUDO_SAFE:
+            o = 1 - k
+            for j, t in enumerate(pos[o]):
+                if 1 <= t <= 51 and (LUDO_START[o] + t - 1) % 52 == a:
+                    pos[o][j] = 0
+                    extra = True
+                    text += f" 💥 و مهره {LUDO_PAWNS[o][j]} حریف رو زد!"
+    if new == 57:
+        extra = True
+        text += " 🏁 رسید به مقصد!"
+    return extra, text
+
+def _ludo_next(g, extra):
+    if not extra:
+        g["turn"] = 1 - g["turn"]
+        g["sixes"] = 0
+    g["dice"] = None
+    g["legal"] = []
+
+def _ludo_finish_turn(g, k, extra):
+    if all(t == 57 for t in g["pos"][k]):
+        g["winner"] = k
+        g["dice"] = None
+        g["legal"] = []
+        return
+    _ludo_next(g, extra)
+    if extra:
+        g["log"] += " — نوبت دوباره 🎁"
+
+def ludo_roll(g):
+    k = g["turn"]
+    name = g["names"][k]
+    d = random.randint(1, 6)
+    g["sixes"] = g["sixes"] + 1 if d == 6 else 0
+    if g["sixes"] >= 3:
+        g["log"] = f"🎲 {d} — سومین ۶ پشت هم! نوبت {name} می‌پره 🙈"
+        _ludo_next(g, False)
+        return
+    legal = ludo_legal(g, k, d)
+    if not legal:
+        g["log"] = f"🎲 {d} — {name} حرکتی نداشت؛ نوبت می‌پره"
+        _ludo_next(g, False)
+        return
+    if len(legal) == 1:
+        extra, text = ludo_move(g, k, legal[0], d)
+        g["log"] = f"🎲 {d} — {text}"
+        _ludo_finish_turn(g, k, extra)
+        return
+    g["dice"] = d
+    g["legal"] = legal
+    g["log"] = f"🎲 {name} {d} آورد؛ یه مهره انتخاب کن"
+
+def ludo_choose(g, k, i):
+    if g["dice"] is None or i not in g["legal"]:
+        return False
+    d = g["dice"]
+    extra, text = ludo_move(g, k, i, d)
+    g["log"] = f"🎲 {d} — {text}"
+    _ludo_finish_turn(g, k, extra)
+    return True
+
+def ludo_text(g):
+    n0, n1 = g["names"]
+    k = g["turn"]
+    fin = [sum(1 for t in g["pos"][x] if t == 57) for x in (0, 1)]
+    text = (
+        f"🎲 منچ دو نفره\n"
+        f"{LUDO_PAWNS[0][0]} {n0}  ⚔️  {LUDO_PAWNS[1][0]} {n1}\n\n"
+        f"{ludo_render(g)}\n\n"
+        f"🏁 رسیده‌ها: {n0} {fin[0]}/4 | {n1} {fin[1]}/4\n"
+    )
+    if g["winner"] is not None:
+        w = g["winner"]
+        text += f"🏆 برنده: {LUDO_PAWNS[w][0]} {g['names'][w]}\n"
+    elif g["dice"] is not None:
+        text += f"👉 نوبت: {LUDO_PAWNS[k][0]} {g['names'][k]} (تاس {g['dice']}؛ مهره رو انتخاب کن)\n"
+    else:
+        text += f"👉 نوبت: {LUDO_PAWNS[k][0]} {g['names'][k]} — تاس بنداز\n"
+    return text + g["log"]
+
+def ludo_markup(g):
+    if g["winner"] is not None:
+        return None
+    k = g["turn"]
+    rows = []
+    if g["dice"] is None:
+        rows.append([InlineKeyboardButton("🎲 تاس بنداز", callback_data="lg:roll")])
+    else:
+        d = g["dice"]
+        btns = []
+        for i in g["legal"]:
+            label = "خروج" if g["pos"][k][i] == 0 else f"+{d}"
+            btns.append(InlineKeyboardButton(f"{LUDO_PAWNS[k][i]} {label}", callback_data=f"lg:mv:{i}"))
+        rows.append(btns)
+    rows.append([InlineKeyboardButton("🏳️ انصراف", callback_data="lg:quit")])
+    return InlineKeyboardMarkup(rows)
+
+async def ludo_callback(client, cq):
+    key = cq.inline_message_id
+    g = LUDO_GAMES.get(key)
+    if not g:
+        await cq.answer("این بازی تموم شده یا منقضی شده 😅", show_alert=True)
+        return
+    uid = cq.from_user.id
+    if uid not in g["ids"]:
+        await cq.answer("این بازی دو نفرست؛ تو بازیکنش نیستی 😎", show_alert=True)
+        return
+    k = g["ids"].index(uid)
+    parts = cq.data.split(":")
+    action = parts[1] if len(parts) > 1 else ""
+
+    if action == "quit":
+        g["winner"] = 1 - k
+        g["log"] = f"🏳️ {g['names'][k]} انصراف داد"
+    elif k != g["turn"]:
+        await cq.answer("نوبت تو نیست ⏳", show_alert=True)
+        return
+    elif action == "roll":
+        if g["dice"] is not None:
+            await cq.answer("اول مهره‌ات رو انتخاب کن 👆", show_alert=True)
+            return
+        ludo_roll(g)
+    elif action == "mv":
+        i = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else -1
+        if not ludo_choose(g, k, i):
+            await cq.answer("این حرکت مجاز نیست", show_alert=True)
+            return
+    else:
+        await cq.answer()
+        return
+
+    try:
+        await cq.edit_message_text(ludo_text(g), parse_mode=ParseMode.DISABLED, reply_markup=ludo_markup(g))
+    except Exception as e:
+        print(f"ludo edit error: {e}")
+    if g["winner"] is not None:
+        LUDO_GAMES.pop(key, None)
+    await cq.answer()
 
 # ==================== 👻 گوست مود (همیشه آنلاین) ====================
 def set_ghost(value):
@@ -524,7 +799,8 @@ async def admin_commands(client, message):
             err = None
             if BOT_USERNAME:
                 try:
-                    results = await client.get_inline_bot_results(BOT_USERNAME, "panel")
+                    fid = chat_id if (message.chat.type.value == "private" and chat_id != me.id) else 0
+                    results = await client.get_inline_bot_results(BOT_USERNAME, f"panel {fid}")
                     if not results.results:
                         raise Exception("ربات کمکی جواب نداد؛ مطمئن شو Inline Mode روشنه و کد بالاست")
                     await client.send_inline_bot_result(chat_id, results.query_id, results.results[0].id)
@@ -562,7 +838,8 @@ async def admin_commands(client, message):
                 "👑 **داشبورد فرمانروایی یوزربات آریا:**\n"
                 "_(هر دستور رو هم فارسی می‌تونی بزنی هم انگلیسی)_\n\n"
                 "🎛 **پنل:**\n"
-                "• `پنل` ➡️ باز کردن پنل شیشه‌ای (گوست مود + افکت تایپ)\n"
+                "• `پنل` ➡️ باز کردن پنل شیشه‌ای (گوست مود + افکت تایپ + بازی‌ها)\n"
+                "• 🎲 منچ دو نفره: توی پیوی دوستت `پنل` بزن ← «🎮 بازی‌ها» ← «منچ»\n"
                 "• `گوست روشن` / `گوست خاموش` ➡️ همیشه آنلاین 👻\n"
                 "• `تایپ روشن` / `تایپ خاموش` ➡️ افکت «در حال تایپ» تا جواب ندادی ⌨️\n\n"
                 "⚙️ **تنظیمات مشتی و منشی (ارسال در سیو مسج):**\n"
