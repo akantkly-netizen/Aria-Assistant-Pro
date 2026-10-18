@@ -9,8 +9,14 @@ import math
 import shutil
 import subprocess
 from datetime import datetime
-from pyrogram import Client, filters
+from pyrogram import Client, filters, idle
 from pyrogram.enums import ChatAction
+from pyrogram.raw import functions
+from pyrogram.handlers import InlineQueryHandler, CallbackQueryHandler
+from pyrogram.types import (
+    InlineKeyboardMarkup, InlineKeyboardButton,
+    InlineQueryResultArticle, InputTextMessageContent
+)
 from PIL import Image, ImageFilter, ImageOps, ImageEnhance
 import edge_tts
 
@@ -19,6 +25,16 @@ API_ID = 20222188
 API_HASH = "254ca8d6906ad33c81aeb5e995c4fb30"
 
 app = Client("aria_assistant", api_id=API_ID, api_hash=API_HASH)
+
+# 🤖 ربات کمکی برای دکمه‌های شیشه‌ای پنل (اینلاین)
+# توکن رو از @BotFather بگیر و تو متغیر محیطی BOT_TOKEN بذار (و اینلاین مود ربات رو با /setinline روشن کن)
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
+bot = Client("aria_helper", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN) if BOT_TOKEN else None
+BOT_USERNAME = None   # بعد از روشن شدن ربات کمکی پر میشه
+OWNER_ID = None       # آیدی عددی خودت، بعد از لاگین پر میشه
+
+# حداکثر مدتی (ثانیه) که افکت تایپ برای یک چت ادامه پیدا می‌کنه تا جواب ندادی
+TYPING_MAX_SECONDS = 30 * 60
 
 # زمان روشن شدن ربات برای محاسبه دقیق آپ‌تایم سیستم
 START_TIME = time.time()
@@ -31,7 +47,9 @@ live_clocks = {}        # وضعیت کلاک‌های زنده فعال در چ
 settings = {
     "night_mode": False,       # مود شب (۱۲ شب تا ۸ صبح)
     "group_assistant": False,  # منشی در گروه‌ها (پیش‌فرض خاموش)
-    "status": "آفلاین"         # وضعیت فعلی آریا (باشگاه، گیم، درس و...)
+    "status": "آفلاین",        # وضعیت فعلی آریا (باشگاه، گیم، درس و...)
+    "ghost": False,            # گوست مود: همیشه آنلاین
+    "typing_fx": False         # افکت تایپ: تا وقتی جواب ندادی «در حال تایپ» نشون بده
 }
 
 # --- بخش دانلودر حرفه‌ای ناهمگام (با پشتیبانی از رزومه و تکه تکه کردن) ---
@@ -313,51 +331,272 @@ async def text_to_voice_male(text, output_file):
     communicate = edge_tts.Communicate(text, voice_style)
     await communicate.save(output_file)
 
+
+# ==================== 🇮🇷 دستورات فارسی ====================
+PERSIAN_DIGITS = str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567890123456789")
+
+# دستورات بدون ورودی (کل پیام باید دقیقاً همین باشه)
+EXACT_ALIASES = {
+    "پنل": "panel", "panel": "panel",
+    "راهنما": "help", "دستورات": "help",
+    "مود شب روشن": "night mode on", "مود شب خاموش": "night mode off",
+    "منشی گروه روشن": "group bot on", "منشی گروه خاموش": "group bot off",
+    "پاک کردن وضعیت": "clear status",
+    "وضعیت گوشی": "status",
+    "گوست روشن": "ghost on", "گوست خاموش": "ghost off",
+    "تایپ روشن": "typing on", "تایپ خاموش": "typing off",
+    "ساخت ویس": ".voice",
+    "دوئل": ".duel",
+    "اطلاعات کاربر": "info",
+    "قدمت اکانت": "age",
+    "آمار چت": "stats",
+    "ساعت زنده": "clock",
+    "توقف ساعت": "stopclock",
+    "ساخت استیکر": "sticker",
+    "استیکر به عکس": "pic",
+    "افکت بلور": ".blur",
+    "افکت شارپ": ".sharpen",
+    "افکت کانتور": ".contour",
+    "افکت سیاه سفید": ".grayscale",
+    "افکت معکوس": ".invert",
+    "افکت جزئیات": ".detail",
+    "افکت لبه": ".edge",
+}
+
+# دستورات متنی: «کلمه: متن»  (دو نقطه باعث میشه وسط چت عادی اشتباهی اجرا نشن)
+COLON_ALIASES = {
+    "ویس": ".voice",
+    "دانلود": ".dl",
+    "پرواز": ".fly",
+    "تابلو": ".marquee",
+    "جلوه": ".effect",
+    "کد": "code",
+    "همه": "all",
+    "پروفایل": "profile",
+    "تنظیم وضعیت": "set status",
+}
+
+def normalize_command(text):
+    """دستور فارسی رو به دستور اصلی ربات تبدیل می‌کنه؛ اگه فارسی نبود همون متن رو برمی‌گردونه"""
+    clean = text.replace("ي", "ی").replace("ك", "ک")   # طول رشته ثابت می‌مونه
+    key = re.sub(r"\s+", " ", clean.replace("\u200c", " ")).strip()
+
+    if key in EXACT_ALIASES:
+        return EXACT_ALIASES[key]
+
+    m = re.match(r"^(?:حذف|پاک)\s+([0-9۰-۹٠-٩]+)$", key)
+    if m:
+        return f"del {m.group(1).translate(PERSIAN_DIGITS)}"
+
+    m = re.match(r"^بمب\s+([0-9۰-۹٠-٩]+)\s+(.+)$", clean, re.S)
+    if m:
+        return f"bomb {m.group(1).translate(PERSIAN_DIGITS)} {text[m.start(2):m.end(2)]}"
+
+    for kw in sorted(COLON_ALIASES, key=len, reverse=True):
+        m = re.match(r"^" + re.escape(kw) + r"\s*[:：]\s*(.+)$", clean, re.S)
+        if m:
+            return f"{COLON_ALIASES[kw]} {text[m.start(1):m.end(1)]}"
+    return text
+
+# ==================== 🎛 پنل شیشه‌ای ====================
+def on_off(value):
+    return "✅ روشن" if value else "❌ خاموش"
+
+def panel_text():
+    return (
+        "🎛 **پنل کنترل آریا**\n\n"
+        f"👻 گوست مود (همیشه آنلاین): {on_off(settings['ghost'])}\n"
+        f"⌨️ افکت تایپ: {on_off(settings['typing_fx'])}\n\n"
+        "با دکمه‌های زیر عوضشون کن 👇"
+    )
+
+def panel_markup():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"👻 گوست مود: {on_off(settings['ghost'])}", callback_data="p_ghost")],
+        [InlineKeyboardButton(f"⌨️ افکت تایپ: {on_off(settings['typing_fx'])}", callback_data="p_typing")],
+        [InlineKeyboardButton("✖️ بستن پنل", callback_data="p_close")],
+    ])
+
+async def panel_inline_query(client, query):
+    print(f"📩 inline query از {query.from_user.id}")
+    # فقط خودت می‌تونی پنل رو ببینی
+    if OWNER_ID is None or query.from_user.id != OWNER_ID:
+        await query.answer([], cache_time=1, is_personal=True)
+        return
+    await query.answer(
+        [InlineQueryResultArticle(
+            id="panel",
+            title="🎛 پنل کنترل آریا",
+            input_message_content=InputTextMessageContent(panel_text()),
+            reply_markup=panel_markup()
+        )],
+        cache_time=0, is_personal=True
+    )
+
+async def panel_callback(client, cq):
+    if OWNER_ID is None or cq.from_user.id != OWNER_ID:
+        await cq.answer("این پنل مال تو نیست 😎", show_alert=True)
+        return
+    if cq.data == "p_ghost":
+        set_ghost(not settings["ghost"])
+    elif cq.data == "p_typing":
+        set_typing_fx(not settings["typing_fx"])
+    elif cq.data == "p_close":
+        try:
+            await cq.edit_message_text("🎛 پنل بسته شد.")
+        except Exception:
+            pass
+        await cq.answer()
+        return
+    try:
+        await cq.edit_message_text(panel_text(), reply_markup=panel_markup())
+    except Exception as e:
+        print(f"panel edit error: {e}")
+    await cq.answer("انجام شد ✅")
+
+# ==================== 👻 گوست مود (همیشه آنلاین) ====================
+def set_ghost(value):
+    settings["ghost"] = value
+    if not value:
+        asyncio.get_event_loop().create_task(_go_offline())
+
+async def _go_offline():
+    try:
+        await app.invoke(functions.account.UpdateStatus(offline=True))
+    except Exception:
+        pass
+
+async def ghost_loop():
+    while True:
+        try:
+            if settings["ghost"]:
+                await app.invoke(functions.account.UpdateStatus(offline=False))
+        except Exception as e:
+            print(f"ghost loop error: {e}")
+        await asyncio.sleep(20)
+
+# ==================== ⌨️ افکت تایپ ====================
+typing_tasks = {}   # chat_id -> task
+
+async def typing_loop(client, chat_id):
+    started = time.time()
+    try:
+        while settings["typing_fx"] and time.time() - started < TYPING_MAX_SECONDS:
+            await client.send_chat_action(chat_id, ChatAction.TYPING)
+            await asyncio.sleep(4)
+    except asyncio.CancelledError:
+        pass
+    except Exception as e:
+        print(f"typing loop error: {e}")
+    finally:
+        if typing_tasks.get(chat_id) is asyncio.current_task():
+            typing_tasks.pop(chat_id, None)
+
+async def stop_typing(client, chat_id):
+    task = typing_tasks.pop(chat_id, None)
+    if task:
+        task.cancel()
+        try:
+            await client.send_chat_action(chat_id, ChatAction.CANCEL)
+        except Exception:
+            pass
+
+def set_typing_fx(value):
+    settings["typing_fx"] = value
+    if not value:
+        for task in list(typing_tasks.values()):
+            task.cancel()
+        typing_tasks.clear()
+
 # --- بخش اول: دستورات ادمین (فقط خودت می‌توانی اجرا کنی) ---
 @app.on_message(filters.me & filters.text)
 async def admin_commands(client, message):
     try:
         text = message.text.strip() if message.text else ""
+        text = normalize_command(text)   # 🇮🇷 دستور فارسی -> دستور اصلی
         text_lower = text.lower()
         chat_id = message.chat.id
         me = await client.get_me()
         is_saved_messages = message.chat.type.value == "private" and message.chat.id == me.id
 
+        # 🔹 پنل شیشه‌ای (گوست مود + افکت تایپ)
+        if text_lower == "panel":
+            err = None
+            if BOT_USERNAME:
+                try:
+                    results = await client.get_inline_bot_results(BOT_USERNAME, "panel")
+                    if not results.results:
+                        raise Exception("ربات کمکی جواب نداد؛ مطمئن شو Inline Mode روشنه و کد بالاست")
+                    await client.send_inline_bot_result(chat_id, results.query_id, results.results[0].id)
+                    try:
+                        await message.delete()
+                    except Exception:
+                        pass
+                    return
+                except Exception as e:
+                    err = f"{type(e).__name__}: {e}"
+                    print(f"inline panel error: {err}")
+            else:
+                err = "BOT_TOKEN ست نشده یا ربات کمکی بالا نیومده"
+            # اگه دکمه‌ها نشد، پنل متنی + دلیل خطا
+            await message.edit_text(
+                panel_text().replace("با دکمه‌های زیر عوضشون کن 👇",
+                                     "فعلاً با دستور عوض کن:\n"
+                                     "`گوست روشن` / `گوست خاموش`\n`تایپ روشن` / `تایپ خاموش`")
+                + f"\n\n⚠️ دکمه‌ها باز نشد:\n`{err}`"
+            )
+            return
+
+        if text_lower in ("ghost on", "ghost off"):
+            set_ghost(text_lower == "ghost on")
+            await message.edit_text("👻 **گوست مود روشن شد؛ همیشه آنلاینی.**" if settings["ghost"] else "👻 **گوست مود خاموش شد.**")
+            return
+        if text_lower in ("typing on", "typing off"):
+            set_typing_fx(text_lower == "typing on")
+            await message.edit_text("⌨️ **افکت تایپ روشن شد.**" if settings["typing_fx"] else "⌨️ **افکت تایپ خاموش شد.**")
+            return
+
         # 🔹 قابلیت راهنمای کامل دستورات (فقط در بخش Saved Messages کار می‌کند)
         if is_saved_messages and text_lower == "help":
             help_text = (
-                "👑 **داشبورد فرمانروایی یوزربات آریا:**\n\n"
+                "👑 **داشبورد فرمانروایی یوزربات آریا:**\n"
+                "_(هر دستور رو هم فارسی می‌تونی بزنی هم انگلیسی)_\n\n"
+                "🎛 **پنل:**\n"
+                "• `پنل` ➡️ باز کردن پنل شیشه‌ای (گوست مود + افکت تایپ)\n"
+                "• `گوست روشن` / `گوست خاموش` ➡️ همیشه آنلاین 👻\n"
+                "• `تایپ روشن` / `تایپ خاموش` ➡️ افکت «در حال تایپ» تا جواب ندادی ⌨️\n\n"
                 "⚙️ **تنظیمات مشتی و منشی (ارسال در سیو مسج):**\n"
-                "• `night mode on` ➡️ فعال‌سازی مود شب\n"
-                "• `night mode off` ➡️ غیرفعال‌سازی مود شب\n"
-                "• `group bot on` ➡️ فعال‌سازی منشی باصفا در گروه‌ها\n"
-                "• `group bot off` ➡️ خاموش کردن منشی گروه‌ها\n"
-                "• `set status [متن]` ➡️ تگ کردن وضعیت چاکریم\n"
-                "• `clear status` ➡️ پاک کردن وضعیت فعلی\n"
-                "• `status` ➡️ آمار و ارقام موتور گوشی (باتری، رم و آپ‌تایم ربات)\n"
-                "• `profile [آیدی]` ➡️ دانلود رگباری تمام عکس‌های پروفایل طرف\n\n"
-                "🛠 **ابزارهای زنده, دست‌فرمان‌ها و قابلیت‌های خاص:**\n"
-                "• `.voice` یا `.tts` ➡️ تبدیل متن به ویس صوتی مردونه بدون تحریم 🎙\n"
-                "• `.dl [لینک]` ➡️ لیچ فیلم (پخش لایو)، لینک‌های عادی و گوگل‌پلی/مایکت ⚡️\n"
-                "• `.fly [متن]` ➡️ پرواز تماشایی هواپیما روی متنت 🛫\n"
-                "• `.duel` ➡️ شروع مبارزه و دوئل متحرک لایو مچ‌اندازی ⚔️\n"
-                "• `bomb [تعداد] [متن]` ➡️ به توپ بستن و ارسال رگباری پیام\n"
-                "• `code [متن]` ➡️ مشتی کردن کدهات توی باکس پایتون\n"
-                "• `del [تعداد]` ➡️ غیب کردن پیام‌های خودت به صورت دوطرفه\n"
-                "• `info` ➡️ تار و پود و آمار کارآگاهی طرف\n"
-                "• `age` ➡️ حساب کتابِ اینکه طرف چند ساله تو تلگرامه\n"
-                "• `stats` ➡️ آمارگیر کل تاریخچه چت جاری بدون هیچ محدوبیتی 📊\n"
-                "• `clock` ➡️ ساعت دیجیتال زنده و ثانیه‌شمار تو چت\n"
-                "• `stopclock` ➡️ متوقف کردن ساعت لایو\n"
-                "• `.marquee [متن]` ➡️ راه انداختن تابلوروان متحرک دور متنت\n"
-                "• `.effect [متن]` ➡️ افکت متحرک سه مرحله‌ای مشتی واسه متنت\n\n"
+                "• `مود شب روشن` / `مود شب خاموش` ➡️ مود شب (`night mode on/off`)\n"
+                "• `منشی گروه روشن` / `منشی گروه خاموش` ➡️ منشی گروه‌ها (`group bot on/off`)\n"
+                "• `تنظیم وضعیت: متن` ➡️ تگ کردن وضعیت (`set status [متن]`)\n"
+                "• `پاک کردن وضعیت` ➡️ ریست وضعیت (`clear status`)\n"
+                "• `وضعیت گوشی` ➡️ باتری، رم و آپ‌تایم (`status`)\n"
+                "• `پروفایل: @آیدی` ➡️ دانلود عکس‌های پروفایل طرف (`profile [آیدی]`)\n\n"
+                "🛠 **ابزارهای زنده و قابلیت‌های خاص:**\n"
+                "• `ویس: متن` ➡️ تبدیل متن به ویس مردونه (`.voice`) — یا ریپلای + `ساخت ویس`\n"
+                "• `دانلود: لینک` ➡️ دانلودر لینک/گوگل‌پلی/مایکت (`.dl [لینک]`)\n"
+                "• `پرواز: متن` ➡️ پرواز هواپیما روی متن (`.fly`)\n"
+                "• `دوئل` ➡️ مبارزه متحرک با ریپلای (`.duel`)\n"
+                "• `بمب 5 متن` ➡️ ارسال رگباری پیام (`bomb [تعداد] [متن]`)\n"
+                "• `کد: متن` ➡️ باکس کد پایتون (`code [متن]`)\n"
+                "• `حذف 5` ➡️ پاک کردن ۵ پیام خودت (`del [تعداد]`)\n"
+                "• `اطلاعات کاربر` ➡️ مشخصات طرف با ریپلای (`info`)\n"
+                "• `قدمت اکانت` ➡️ سن اکانت طرف با ریپلای (`age`)\n"
+                "• `آمار چت` ➡️ آمار کل تاریخچه چت (`stats`)\n"
+                "• `ساعت زنده` ➡️ ساعت دیجیتال زنده (`clock`)\n"
+                "• `توقف ساعت` ➡️ خاموش کردن ساعت (`stopclock`)\n"
+                "• `تابلو: متن` ➡️ تابلو روان (`.marquee`)\n"
+                "• `جلوه: متن` ➡️ افکت متنی سه مرحله‌ای (`.effect`)\n\n"
                 "👥 **دستورات گروهی:**\n"
-                "• `all [متن]` ➡️ تگ همگانی نامرئی\n\n"
-                "🎨 **ابزار استیکر (با ریپلای روی پیام):**\n"
-                "• `sticker` ➡️ تبدیل عکس به استیکر مشتی\n"
-                "• `pic` ➡️ بیرون کشیدن عکس باکیفیت از دل استیکر\n\n"
+                "• `همه: متن` ➡️ تگ همگانی نامرئی (`all [متن]`)\n\n"
+                "🎨 **ابزار استیکر و عکس (با ریپلای روی پیام):**\n"
+                "• `ساخت استیکر` ➡️ عکس به استیکر (`sticker`)\n"
+                "• `استیکر به عکس` ➡️ استیکر به عکس (`pic`)\n"
+                "• `افکت بلور` / `شارپ` / `کانتور` / `سیاه سفید` / `معکوس` / `جزئیات` / `لبه`\n"
+                "  _(مثلاً `افکت بلور`؛ انگلیسیش `.blur` و ...)_\n\n"
                 "🎮 **بازی دوز:**\n"
-                "• بفرست `دوز` یا `dooz` تو پی‌وی هر کی؛ ربات ردیف میشه واسه بازی!"
+                "• بفرست `دوز` یا `dooz` تو پی‌وی هر کی؛ ربات ردیف میشه واسه بازی!\n\n"
+                "📸 **ذخیره خودکار:** عکس و فیلم‌های ثانیه‌ای و یک‌بار مصرف خودکار میرن تو Saved Messages."
             )
             await message.reply_text(help_text)
             return
@@ -806,25 +1045,59 @@ async def admin_commands(client, message):
     except Exception as e:
         print(f"🛡 [آنتی کرش ادمین]: جلوی یک ارور سیستمی تلگرام گرفته شد: {e}")
 
+
+# --- ذخیره مدیاهای ثانیه‌ای و یک‌بار مصرف ---
+VIEW_ONCE_TTL = 2147483647   # تلگرام برای «یک‌بار مشاهده» این عدد رو میذاره
+
+async def save_timed_media(client, message):
+    try:
+        kind, media = None, None
+        for k in ("photo", "video", "video_note", "voice"):
+            m = getattr(message, k, None)
+            if m is not None and getattr(m, "ttl_seconds", None):
+                kind, media = k, m
+                break
+        if media is None:
+            return
+
+        ttl = media.ttl_seconds
+        sender = message.from_user
+        sender_name = sender.first_name if sender else "ناشناس"
+        sender_user = f" (@{sender.username})" if sender and sender.username else ""
+        chat_name = message.chat.title if message.chat.title else "پیوی"
+        names = {"photo": "عکس", "video": "فیلم", "video_note": "ویدیو مسیج", "voice": "ویس"}
+        icons = {"photo": "📸", "video": "🎥", "video_note": "⭕️", "voice": "🎙"}
+        if ttl >= VIEW_ONCE_TTL:
+            kind_text = f"{names[kind]} یک‌بار مصرف"
+        else:
+            kind_text = f"{names[kind]} ثانیه‌ای ({ttl} ثانیه)"
+        caption = f"{icons[kind]} {kind_text}\n👤 فرستنده: {sender_name}{sender_user}\n💬 چت: {chat_name}"
+
+        file_path = await client.download_media(message)
+        if not file_path:
+            return
+        try:
+            if kind == "photo":
+                await client.send_photo("me", photo=file_path, caption=caption)
+            elif kind == "video":
+                await client.send_video("me", video=file_path, caption=caption)
+            elif kind == "video_note":
+                await client.send_video_note("me", video_note=file_path)
+                await client.send_message("me", caption)
+            else:
+                await client.send_voice("me", voice=file_path, caption=caption)
+        finally:
+            if os.path.exists(file_path):
+                os.remove(file_path)
+    except Exception as e:
+        print(f"save_timed_media error: {e}")
+
 # --- قابلیت ذخیره خودکار مدیاهای یکبار مصرف (Anti View-Once) ---
 @app.on_message(~filters.me & (filters.private | filters.group))
 async def catch_view_once(client, message):
     try:
-        is_vo = False
-        if message.photo and message.photo.ttl_seconds: is_vo = True
-        elif message.video and message.video.ttl_seconds: is_vo = True
-
-        if is_vo:
-            try:
-                sender_name = message.from_user.first_name if message.from_user else "ناشناس"
-                file_path = await client.download_media(message)
-                if message.photo:
-                    await client.send_photo("me", photo=file_path, caption=f"📸 فرستنده: {sender_name}")
-                else:
-                    await client.send_video("me", video=file_path, caption=f"🎥 فرستنده: {sender_name}")
-                if os.path.exists(file_path): os.remove(file_path)
-            except Exception: 
-                pass
+        # 📸 ذخیره خودکار عکس/فیلم/ویس/ویدیو مسیج ثانیه‌ای و یک‌بار مصرف توی Saved Messages
+        await save_timed_media(client, message)
 
         # --- مدیریت منشی و بازی دوز ---
         text = message.text.strip() if message.text else ""
@@ -1013,10 +1286,50 @@ async def clean_game_end(client, chat_id, final_text, game):
     try: await client.delete_messages(chat_id, [end_msg.id, game["bot_msg_id"], game["user_dooz_msg_id"], game.get("diff_msg_id")])
     except Exception: pass
 
-@app.on_message(filters.private & filters.me)
+# group=1 تا کنار هندلر دستورات اجرا بشه (پایروگرام تو هر گروه فقط اولین هندلر مچ‌شده رو اجرا می‌کنه)
+@app.on_message(filters.private & filters.me, group=1)
 async def clear_game_on_my_reply(client, message):
     chat_id = message.chat.id
     if chat_id in games: del games[chat_id]
+    # جواب دادی؛ افکت تایپ این چت قطع میشه
+    await stop_typing(client, chat_id)
+
+# ⌨️ افکت تایپ: وقتی کسی پیوی پیام میده تا جواب ندادی «در حال تایپ» نشون بده
+@app.on_message(filters.private & filters.incoming, group=1)
+async def typing_effect_start(client, message):
+    if not settings["typing_fx"]:
+        return
+    user = message.from_user
+    if user is None or user.is_self or user.is_bot:
+        return
+    chat_id = message.chat.id
+    if chat_id in typing_tasks:
+        return
+    typing_tasks[chat_id] = asyncio.create_task(typing_loop(client, chat_id))
+
+async def main():
+    global OWNER_ID, BOT_USERNAME
+    await app.start()
+    OWNER_ID = (await app.get_me()).id
+
+    if bot:
+        try:
+            bot.add_handler(InlineQueryHandler(panel_inline_query))
+            bot.add_handler(CallbackQueryHandler(panel_callback))
+            await bot.start()
+            BOT_USERNAME = (await bot.get_me()).username
+            print(f"🎛 ربات پنل بالا اومد: @{BOT_USERNAME}")
+        except Exception as e:
+            print(f"❌ ربات کمکی بالا نیومد: {e}")
+    else:
+        print("ℹ️ BOT_TOKEN ست نشده؛ پنل به صورت متنی کار می‌کنه.")
+
+    asyncio.create_task(ghost_loop())
+    await idle()
+
+    if bot and BOT_USERNAME:
+        await bot.stop()
+    await app.stop()
 
 print("🔥 ربات با سیستم آنتی کرش ریل‌وی و بدون بخش قیمت ارز بالا آمد... چاکریم! ⚡️")
-app.run()
+app.run(main())
