@@ -15,8 +15,8 @@ from PIL import Image, ImageFilter, ImageOps, ImageEnhance
 import edge_tts
 
 # استفاده از API رسمی و عمومی تلگرام
-API_ID = 6
-API_HASH = "eb06d4abfb49dc3eeb1aeb98ae0f581e"
+API_ID = 20222188
+API_HASH = "254ca8d6906ad33c81aeb5e995c4fb30"
 
 app = Client("aria_assistant", api_id=API_ID, api_hash=API_HASH)
 
