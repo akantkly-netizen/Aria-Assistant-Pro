@@ -1,8 +1,0 @@
-pyrogram==2.0.106
-tgcrypto==1.2.5
-pillow==10.4.0
-psutil==6.0.0
-requests==2.32.3
-aiohttp==3.11.11
-edge-tts
-
